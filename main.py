@@ -47,6 +47,7 @@ class TGBot:
         logger.info(_("Starting BetterForward..."))
         self.group_id = int(group_id)
         self.bot = telebot.TeleBot(bot_token)
+        self.bot.message_handler(commands=["start"])(self.start_message)
         self.bot.message_handler(commands=["auto_response"])(self.manage_auto_response)
         self.bot.message_handler(commands=["terminate"])(self.handle_terminate)
         self.bot.message_handler(func=lambda m: True, content_types=["photo", "text", "sticker", "video", "document"])(
@@ -65,6 +66,9 @@ class TGBot:
                  "`/auto_response set <key> <value> <topic_action(0/1)>`\n"
                  "`/auto_response delete <key>`\n"
                  "`/auto_response list`")
+
+    def start_message(self, message: Message):
+        self.bot.send_message(message.chat.id, _("欢迎使用 pm_jp_bot, 消息直接发送即可。"))
 
     def manage_auto_response(self, message: Message):
         if message.chat.id == self.group_id:
