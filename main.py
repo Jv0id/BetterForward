@@ -47,7 +47,9 @@ class TGBot:
         logger.info(_("Starting BetterForward..."))
         self.group_id = int(group_id)
         self.bot = telebot.TeleBot(bot_token)
+
         self.bot.message_handler(commands=["start"])(self.start_message)
+
         self.bot.message_handler(commands=["auto_response"])(self.manage_auto_response)
         self.bot.message_handler(commands=["terminate"])(self.handle_terminate)
         self.bot.message_handler(func=lambda m: True, content_types=["photo", "text", "sticker", "video", "document"])(
