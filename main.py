@@ -1,19 +1,28 @@
 import argparse
 import gettext
 import importlib
+import json
 import logging
 import os
+import queue
+import re
 import signal
 import sqlite3
+import threading
+from traceback import print_exc
 
 import telebot
-from telebot.apihelper import create_forum_topic, delete_forum_topic, close_forum_topic
+from telebot import types
+from telebot.apihelper import create_forum_topic, close_forum_topic, ApiTelegramException, delete_forum_topic, \
+    reopen_forum_topic
 from telebot.types import Message
+
+from cache import CacheHelper
 
 parser = argparse.ArgumentParser(description="")
 parser.add_argument("-token", type=str, required=True, help="Telegram bot token")
 parser.add_argument("-group_id", type=str, required=True, help="Group ID")
-parser.add_argument("-language", type=str, default="en_US", help="Language", choices=["en_US", "zh_CN"])
+parser.add_argument("-language", type=str, default="en_US", help="Language", choices=["en_US", "zh_CN", "ja_JP"])
 args = parser.parse_args()
 
 logger = logging.getLogger()
@@ -51,73 +60,33 @@ class TGBot:
         self.bot.message_handler(commands=["start"])(self.start_message)
 
         self.bot.message_handler(commands=["auto_response"])(self.manage_auto_response)
+        self.bot.message_handler(commands=["help"])(self.help)
+        self.bot.message_handler(commands=["ban"])(self.ban_user)
+        self.bot.message_handler(commands=["unban"])(self.unban_user)
         self.bot.message_handler(commands=["terminate"])(self.handle_terminate)
         self.bot.message_handler(func=lambda m: True, content_types=["photo", "text", "sticker", "video", "document"])(
-            self.handle_messages)
+            self.push_messages)
+        self.bot.callback_query_handler(func=lambda call: True)(self.callback_query)
         self.db_path = db_path
         self.upgrade_db()
         self.bot.set_my_commands([
+            telebot.types.BotCommand("help", _("Show help")),
+            telebot.types.BotCommand("ban", _("Ban a user")),
+            telebot.types.BotCommand("unban", _("Unban a user")),
             telebot.types.BotCommand("terminate", _("Terminate a thread")),
         ])
+        self.cache = CacheHelper()
         self.check_permission()
+        self.message_queue = queue.Queue()
+        self.message_processor = threading.Thread(target=self.process_messages)
+        self.message_processor.start()
         self.bot.infinity_polling(skip_pending=True, timeout=30)
 
-    def get_auto_response_help(self):
-        return _("Invalid command\n"
-                 "Correct usage:\n"
-                 "`/auto_response set <key> <value> <topic_action(0/1)>`\n"
-                 "`/auto_response delete <key>`\n"
-                 "`/auto_response list`")
+    def check_valid_chat(self, message: Message):
+        return message.chat.id == self.group_id and message.message_thread_id is None
 
     def start_message(self, message: Message):
         self.bot.send_message(message.chat.id, _("欢迎使用 pm_jp_bot, 消息直接发送即可。"))
-
-    def manage_auto_response(self, message: Message):
-        if message.chat.id == self.group_id:
-            if len((msg_split := message.text.split(" "))) < 2:
-                self.bot.reply_to(message, self.get_auto_response_help(), parse_mode="Markdown")
-                return
-            with sqlite3.connect(self.db_path) as db:
-                db_cursor = db.cursor()
-                match msg_split[1]:
-                    case "list":
-                        result = db_cursor.execute("SELECT key, value, topic_action FROM auto_response")
-                        content = _("Auto response list")
-                        content += "\n" + "-" * 20 + "\n"
-                        for row in result.fetchall():
-                            content += _("Trigger: {}\nResponse: {}\nForward message: {}\n").format(row[0], row[1],
-                                                                                                    _("Enable") if row[
-                                                                                                        2]
-                                                                                                    else _("Disable"))
-                            content += "-" * 20 + "\n"
-                        self.bot.reply_to(message, content)
-                        return
-                    case "set":
-                        if len(msg_split) not in [4, 5]:
-                            self.bot.reply_to(message, self.get_auto_response_help(), parse_mode="Markdown")
-                            return
-                        key = msg_split[2]
-                        value = msg_split[3]
-                        topic_action = int(msg_split[4]) if len(msg_split) == 5 else 0
-                        # Check if key exists
-                        db_cursor.execute("SELECT key FROM auto_response WHERE key = ?", (key,))
-                        if db_cursor.fetchone() is not None:
-                            db_cursor.execute("UPDATE auto_response SET value = ?, topic_action = ? WHERE key = ?",
-                                              (value, topic_action, key))
-                        else:
-                            db_cursor.execute("INSERT INTO auto_response (key, value, topic_action) VALUES (?, ?, ?)",
-                                              (key, value, topic_action))
-                        self.bot.reply_to(message, _("Auto response set"))
-                    case "delete":
-                        if len(msg_split) != 3:
-                            self.bot.reply_to(message, self.get_auto_response_help(), parse_mode="Markdown")
-                            return
-                        key = msg_split[2]
-                        db_cursor.execute("DELETE FROM auto_response WHERE key = ?", (key,))
-                        self.bot.reply_to(message, _("Auto response deleted"))
-                    case _:
-                        self.bot.reply_to(message, _("Invalid operation"))
-                db.commit()
 
     def upgrade_db(self):
         try:
@@ -131,67 +100,112 @@ class TGBot:
         files = [f for f in os.listdir(db_migrate_dir) if f.endswith('.py')]
         files.sort(key=lambda x: int(x.split('_')[0]))
         for file in files:
-            version = int(file.split('_')[0])
-            if version > current_version:
-                logger.info(_("Upgrading database to version {}").format(version))
-                module = importlib.import_module(f"db_migrate.{file[:-3]}")
-                module.upgrade(self.db_path)
-                with sqlite3.connect(self.db_path) as db:
-                    db_cursor = db.cursor()
-                    db_cursor.execute("UPDATE settings SET value = ? WHERE key = 'db_version'", (str(version),))
-                    db.commit()
+            try:
+                if (version := int(file.split('_')[0])) > current_version:
+                    logger.info(_("Upgrading database to version {}").format(version))
+                    module = importlib.import_module(f"db_migrate.{file[:-3]}")
+                    module.upgrade(self.db_path)
+                    with sqlite3.connect(self.db_path) as db:
+                        db_cursor = db.cursor()
+                        db_cursor.execute("UPDATE settings SET value = ? WHERE key = 'db_version'", (str(version),))
+                        db.commit()
+            except Exception:
+                logger.error(_("Failed to upgrade database"))
+                print_exc()
+                exit(1)
 
     # Get thread_id to terminate when needed
-    def terminate_thread(self, thread_id):
-        logger.info(_("Terminating thread") + str(thread_id))
-        delete_forum_topic(chat_id=self.group_id, message_thread_id=thread_id, token=self.bot.token)
+    def terminate_thread(self, thread_id=None, user_id=None):
         with sqlite3.connect(self.db_path) as db:
             db_cursor = db.cursor()
-            db_cursor.execute("DELETE FROM topics WHERE thread_id = ?", (thread_id,))
-            db.commit()
+            if thread_id is not None:
+                db_cursor.execute("DELETE FROM topics WHERE thread_id = ?", (thread_id,))
+                db.commit()
+            elif user_id is not None:
+                result = db_cursor.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1", (user_id,))
+                if (thread_id := result.fetchone()[0]) is not None:
+                    db_cursor.execute("DELETE FROM topics WHERE user_id = ?", (user_id,))
+                    db.commit()
+            try:
+                delete_forum_topic(chat_id=self.group_id, message_thread_id=thread_id, token=self.bot.token)
+            except ApiTelegramException:
+                pass
+        logger.info(_("Terminating thread") + str(thread_id))
 
     # To terminate and totally delete the topic
     def handle_terminate(self, message: Message):
         if message.chat.id == self.group_id:
+            user_id = None
+            thread_id = None
             if message.message_thread_id is None:
                 if len((msg_split := message.text.split(" "))) != 2:
                     self.bot.reply_to(message, "Invalid command\n"
                                                "Correct usage:```\n"
                                                "/terminate <user ID>```", parse_mode="Markdown")
                     return
-                thread_id = int(msg_split[1])
+                user_id = int(msg_split[1])
             else:
                 thread_id = message.message_thread_id
             if thread_id == 1:
                 self.bot.reply_to(message, _("Cannot terminate main thread"))
                 return
             try:
-                self.terminate_thread(thread_id)
+                self.terminate_thread(thread_id=thread_id, user_id=user_id)
                 if message.message_thread_id is None:
                     self.bot.reply_to(message, _("Thread terminated"))
             except Exception:
                 logger.error(_("Failed to terminate the thread") + str(thread_id))
                 self.bot.reply_to(message, _("Failed to terminate the thread"))
 
-    # To forward your words
-    def handle_messages(self, message: Message):
+    def match_auto_response(self, text):
+        if text is None:
+            return None
+        with sqlite3.connect(self.db_path) as db:
+            # Check for exact match
+            db_cursor = db.cursor()
+            db_cursor.execute("SELECT value, topic_action FROM auto_response WHERE key = ? AND is_regex = 0 LIMIT 1",
+                              (text,))
+            result = db_cursor.fetchone()
+            if result is not None:
+                return {"response": result[0], "topic_action": result[1]}
+
+            # Check for regex
+            db_cursor.execute("SELECT key, value, topic_action FROM auto_response WHERE is_regex = 1")
+            result = db_cursor.fetchall()
+            for row in result:
+                if re.match(row[0], text):
+                    return {"response": row[1], "topic_action": row[2]}
+            return None
+
+    # Push messages to the queue
+    def push_messages(self, message: Message):
+        self.message_queue.put(message)
+
+    # Main message handler
+    def handle_message(self, message: Message, retry=False):
         # Not responding in General topic
-        if message.message_thread_id is None and message.chat.id == self.group_id:
+        if self.check_valid_chat(message):
             return
         with sqlite3.connect(self.db_path) as db:
             curser = db.cursor()
             if message.chat.id != self.group_id:
-                logger.info(_("Received message from {}, content: {}").format(message.from_user.id, message.text))
+                logger.info(
+                    _("Received message from {}, content: {}, type: {}").format(message.from_user.id, message.text,
+                                                                                message.content_type))
+                # Check if the user is banned
+                if (result := curser.execute("SELECT ban FROM topics WHERE user_id = ? LIMIT 1",
+                                             (message.from_user.id,)).fetchone()) and result[0] == 1:
+                    logger.info(_("User {} is banned").format(message.from_user.id))
+                    return
                 # Auto response
-                result = curser.execute("SELECT value, topic_action FROM auto_response WHERE key = ?", (message.text,))
-                if (result:=result.fetchone()) is None:
-                    auto_response, topic_action = None, None
-                else:
-                    auto_response, topic_action = result
-                if auto_response is not None:
-                    self.bot.send_message(message.chat.id, auto_response)
-                    if not topic_action:
-                        return
+                topic_action = False
+                auto_response = None
+                if (auto_response_result := self.match_auto_response(message.text)) is not None:
+                    if not retry:
+                        self.bot.send_message(message.chat.id, auto_response_result["response"])
+                    if auto_response_result["topic_action"]:
+                        topic_action = True
+                        auto_response = auto_response_result["response"]
                 # Forward message to group
                 userid = message.from_user.id
                 result = curser.execute("SELECT thread_id FROM topics WHERE user_id = ?", (userid,))
@@ -207,8 +221,10 @@ class TGBot:
                         return
                     curser.execute("INSERT INTO topics (user_id, thread_id) VALUES (?, ?)",
                                    (userid, topic["message_thread_id"]))
+                    db.commit()
                     thread_id = topic["message_thread_id"]
-                    username = _("Not set") if message.from_user.username is None else f"@{message.from_user.username}"
+                    username = _(
+                        "Not set") if message.from_user.username is None else f"@{message.from_user.username}"
                     last_name = "" if message.from_user.last_name is None else f" {message.from_user.last_name}"
                     pin_message = self.bot.send_message(self.group_id,
                                                         f"User ID: {userid}\n"
@@ -216,14 +232,30 @@ class TGBot:
                                                         f"Username: {username}\n",
                                                         message_thread_id=thread_id)
                     self.bot.pin_chat_message(self.group_id, pin_message.message_id)
-                self.bot.forward_message(self.group_id, message.chat.id, message_thread_id=thread_id,
-                                         message_id=message.message_id)
+                else:
+                    thread_id = thread_id[0]
+                try:
+                    self.bot.forward_message(self.group_id, message.chat.id, message_thread_id=thread_id,
+                                             message_id=message.message_id)
+                except ApiTelegramException as e:
+                    if not retry:
+                        self.terminate_thread(thread_id=thread_id)
+                        return self.handle_message(message, retry=True)
+                    else:
+                        logger.error(_("Failed to forward message from user {}".format(message.from_user.id)))
+                        logger.error(e)
+                        self.bot.send_message(self.group_id,
+                                              _("Failed to forward message from user {}".format(message.from_user.id)),
+                                              message_thread_id=None)
+                        self.bot.forward_message(self.group_id, message.chat.id, message_id=message.message_id)
+                        return
                 if topic_action:
                     self.bot.send_message(self.group_id, _("[Auto Response]") + auto_response,
                                           message_thread_id=thread_id)
             else:
                 # Forward message to user
-                result = curser.execute("SELECT user_id FROM topics WHERE thread_id = ?", (message.message_thread_id,))
+                result = curser.execute("SELECT user_id FROM topics WHERE thread_id = ? LIMIT 1",
+                                        (message.message_thread_id,))
                 user_id = result.fetchone()
                 if user_id is not None:
                     match message.content_type:
@@ -248,17 +280,351 @@ class TGBot:
                     close_forum_topic(chat_id=self.group_id, message_thread_id=message.message_thread_id,
                                       token=self.bot.token)
 
+    # Process messages in the queue
+    def process_messages(self):
+        while True:
+            try:
+                self.handle_message(self.message_queue.get())
+            except:
+                logger.error(_("Failed to process message"))
+                print_exc()
+
     def check_permission(self):
         chat_member = self.bot.get_chat_member(self.group_id, self.bot.get_me().id)
         permissions = {
-            "can_manage_topics": chat_member.can_manage_topics,
-            "can_delete_messages": chat_member.can_delete_messages
+            _("Manage Topics"): chat_member.can_manage_topics,
+            _("Delete Messages"): chat_member.can_delete_messages
         }
         for key, value in permissions.items():
             if value is False:
                 logger.error(_("Bot doesn't have {} permission").format(key))
                 self.bot.send_message(self.group_id, _("Bot doesn't have {} permission").format(key))
         self.bot.send_message(self.group_id, _("Bot started successfully"))
+
+    def add_auto_response(self, message: Message):
+        if not self.check_valid_chat(message):
+            return
+        msg = self.bot.edit_message_text(text=_(
+            "Let's set up an automatic response.\nSend /cancel to cancel this operation.\n\n"
+            "Please send the keywords or regular expression that should trigger this response."),
+            chat_id=self.group_id, message_id=message.message_id)
+        self.bot.register_next_step_handler(msg, self.add_auto_response_type)
+
+    def add_auto_response_type(self, message: Message):
+        # 选择是否是正则表达式
+        if not self.check_valid_chat(message):
+            return
+        if message.text == "/cancel":
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            return
+        self.cache.set("auto_response_key", message.text, 300)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅" + _("Yes"),
+                                              callback_data=json.dumps(
+                                                  {"action": "set_auto_reply_type", "regex": 1})))
+        markup.add(types.InlineKeyboardButton("❌" + _("No"),
+                                              callback_data=json.dumps(
+                                                  {"action": "set_auto_reply_type", "regex": 0})))
+        markup.add(
+            types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "add_auto_response"})))
+        help_text = _("Trigger: {}").format(self.cache.get("auto_response_key")) + "\n\n"
+        help_text += _("Is this a regular expression?")
+        self.bot.send_message(text=help_text, chat_id=self.group_id, reply_markup=markup)
+
+    def add_auto_response_value(self, message: Message):
+        if not self.check_valid_chat(message):
+            return
+        if message.text == "/cancel":
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            return
+        msg = self.bot.edit_message_text(text=_("Please send the response message."),
+                                         chat_id=self.group_id, message_id=message.message_id)
+        self.bot.register_next_step_handler(msg, self.add_auto_response_topic_action)
+
+    def add_auto_response_topic_action(self, message: Message):
+        if not self.check_valid_chat(message):
+            return
+        if message.text == "/cancel":
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            self.cache.delete("auto_response_key")
+            return
+        if self.cache.get("auto_response_key") is None:
+            self.bot.send_message(self.group_id, _("The operation has timed out. Please initiate the process again."))
+            return
+        self.cache.set("auto_response_key", self.cache.get("auto_response_key"), 300)
+        self.cache.set("auto_response_value", message.text, 300)
+        self.cache.set("auto_response_regex", self.cache.get("auto_response_regex"), 300)
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("✅" + _("Forward message"),
+                                              callback_data=json.dumps(
+                                                  {"action": "add_auto_reply", "topic_action": 1})))
+        markup.add(types.InlineKeyboardButton("❌" + _("Do not forward message"),
+                                              callback_data=json.dumps(
+                                                  {"action": "add_auto_reply", "topic_action": 0})))
+        markup.add(
+            types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "add_auto_response"})))
+        help_text = ""
+        help_text += _("Trigger: {}").format(self.cache.get("auto_response_key")) + "\n"
+        help_text += _("Response: {}").format(self.cache.get("auto_response_value")) + "\n"
+        help_text += _("Is regex: {}").format("✅" if self.cache.get("auto_response_regex") else "❌") + "\n\n"
+        self.bot.send_message(self.group_id, help_text + _("Do you want to forward the message to the user?"),
+                              reply_markup=markup,
+                              message_thread_id=None)
+
+    def process_add_auto_reply(self, message: Message, data: dict):
+        key = self.cache.pull("auto_response_key")
+        value = self.cache.pull("auto_response_value")
+        is_regex = self.cache.pull("auto_response_regex")
+        markup = types.InlineKeyboardMarkup()
+        back_button = types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "menu"}))
+        if "topic_action" not in data or None in [key, value, is_regex]:
+            self.bot.delete_message(self.group_id, message.id)
+            self.bot.send_message(self.group_id, _("Invalid action"), reply_markup=markup)
+            return
+        topic_action = data["topic_action"]
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute(
+                "INSERT INTO auto_response (key, value, topic_action, is_regex) VALUES (?, ?, ?, ?)",
+                (key, value, topic_action, is_regex))
+            db.commit()
+        markup.add(back_button)
+        self.bot.edit_message_text(_("Auto reply added"), message.chat.id, message.message_id, reply_markup=markup)
+
+    def menu(self, message, edit=False):
+        if not self.check_valid_chat(message):
+            return
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("💬" + _("Auto Reply"),
+                                              callback_data=json.dumps({"action": "auto_reply"})))
+        markup.add(types.InlineKeyboardButton("⛔" + _("Banned Users"),
+                                              callback_data=json.dumps({"action": "ban_user"})))
+        if edit:
+            self.bot.edit_message_text(_("Menu"), message.chat.id, message.message_id, reply_markup=markup)
+        else:
+            self.bot.send_message(self.group_id, _("Menu"), reply_markup=markup, message_thread_id=None)
+
+    def help(self, message: Message):
+        if self.check_valid_chat(message):
+            self.menu(message)
+        else:
+            self.bot.send_message(message.chat.id, _("This command is only available to admin users.") + "\n" +
+                                  "Powered by [BetterForward](https://github.com/SideCloudGroup/BetterForward).",
+                                  parse_mode="Markdown",
+                                  disable_web_page_preview=True)
+
+    def manage_auto_reply(self, message: Message):
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            markup = types.InlineKeyboardMarkup()
+            back_button = types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "menu"}))
+            db_cursor.execute("SELECT id, key, value, topic_action, is_regex FROM auto_response")
+            auto_responses = db_cursor.fetchall()
+            text = _("Auto Reply List:\n")
+            for auto_response in auto_responses:
+                text += "-" * 20 + "\n"
+                text += f"ID: {auto_response[0]}\n"
+                text += _("Trigger: {}").format(auto_response[1]) + "\n"
+                text += _("Response: {}").format(auto_response[2]) + "\n"
+                text += _("Forward message: {}").format("✅" if auto_response[3] else "❌") + "\n"
+                text += _("Is regex: {}").format("✅" if auto_response[4] else "❌") + "\n\n"
+                markup.add(types.InlineKeyboardButton(text=auto_response[1],
+                                                      callback_data=json.dumps({"action": "select_auto_reply",
+                                                                                "id": auto_response[0]})))
+            markup.add(back_button)
+            self.bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+
+    def select_auto_reply(self, message: Message, id: int):
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("SELECT key, value, topic_action, is_regex FROM auto_response WHERE id = ? LIMIT 1",
+                              (id,))
+            auto_response = db_cursor.fetchone()
+            if auto_response is None:
+                self.bot.send_message(self.group_id, _("Auto reply not found"))
+                return
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("❌" + _("Delete"),
+                                                  callback_data=json.dumps({"action": "delete_auto_reply", "id": id})))
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "manage_auto_reply"})))
+            text = _("Trigger: {}").format(auto_response[0]) + "\n"
+            text += _("Response: {}").format(auto_response[1]) + "\n"
+            text += _("Forward message: {}").format("✅" if auto_response[2] else "❌") + "\n"
+            text += _("Is regex: {}").format("✅" if auto_response[3] else "❌") + "\n\n"
+            self.bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+
+    def delete_auto_reply(self, message: Message, id: int):
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("DELETE FROM auto_response WHERE id = ?", (id,))
+            db.commit()
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "manage_auto_reply"})))
+        self.bot.edit_message_text(_("Auto reply deleted"), chat_id=message.chat.id, message_id=message.id,
+                                   reply_markup=markup)
+
+    def ban_user(self, message: Message):
+        if message.chat.id == self.group_id and message.message_thread_id is None:
+            self.bot.send_message(self.group_id, _("This command is not available in the main chat."))
+            return
+        if message.chat.id != self.group_id:
+            return
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("UPDATE topics SET ban = 1 WHERE thread_id = ?", (message.message_thread_id,))
+            db.commit()
+        self.bot.send_message(self.group_id, _("User banned"), message_thread_id=message.message_thread_id)
+        close_forum_topic(chat_id=self.group_id, message_thread_id=message.message_thread_id, token=self.bot.token)
+
+    def unban_user(self, message: Message, user_id: int = None):
+        if message.chat.id != self.group_id:
+            return
+        if user_id is None:
+            if self.check_valid_chat(message):
+                if len((msg_split := message.text.split(" "))) != 2:
+                    self.bot.reply_to(message, "Invalid command\n"
+                                               "Correct usage:```\n"
+                                               "/unban <user ID>```", parse_mode="Markdown")
+                    return
+                user_id = int(msg_split[1])
+        if user_id is None:
+            with sqlite3.connect(self.db_path) as db:
+                db_cursor = db.cursor()
+                db_cursor.execute("UPDATE topics SET ban = 0 WHERE thread_id = ?", (message.message_thread_id,))
+                db.commit()
+            self.bot.send_message(self.group_id, _("User unbanned"), message_thread_id=message.message_thread_id)
+            try:
+                reopen_forum_topic(chat_id=self.group_id, message_thread_id=message.message_thread_id,
+                                   token=self.bot.token)
+            except ApiTelegramException:
+                pass
+        else:
+            with sqlite3.connect(self.db_path) as db:
+                db_cursor = db.cursor()
+                # Check user exists
+                db_cursor.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1", (user_id,))
+                thread_id = db_cursor.fetchone()
+                if thread_id is None:
+                    self.bot.send_message(self.group_id, _("User not found"))
+                    return
+                db_cursor.execute("UPDATE topics SET ban = 0 WHERE user_id = ?", (user_id,))
+                db.commit()
+            try:
+                reopen_forum_topic(chat_id=self.group_id, message_thread_id=thread_id,
+                                   token=self.bot.token)
+            except ApiTelegramException:
+                pass
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "menu"})))
+            if message.from_user.id == self.bot.get_me().id:
+                self.bot.edit_message_text(_("User unbanned"), message.chat.id, message.message_id, reply_markup=markup)
+            else:
+                self.bot.send_message(self.group_id, _("User unbanned"), reply_markup=markup)
+
+    def manage_ban_user(self, message: Message):
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            markup = types.InlineKeyboardMarkup()
+            back_button = types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "menu"}))
+            db_cursor.execute("SELECT user_id FROM topics WHERE ban = 1")
+            banned_users = db_cursor.fetchall()
+            text = _("Banned User List:") + "\n"
+            for user in banned_users:
+                text += "-" * 20 + "\n"
+                text += f"User ID: {user[0]}\n"
+                markup.add(types.InlineKeyboardButton(text=user[0],
+                                                      callback_data=json.dumps(
+                                                          {"action": "select_ban_user", "id": user[0]})))
+            markup.add(back_button)
+            self.bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+
+    def select_ban_user(self, message: Message, id: int):
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1", (id,))
+            thread_id = db_cursor.fetchone()
+            if thread_id is None:
+                self.bot.send_message(self.group_id, _("User not found"))
+                return
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("❌" + _("Unban"),
+                                                  callback_data=json.dumps({"action": "unban_user", "id": id}))
+                       )
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "manage_ban_user"})))
+            self.bot.edit_message_text(f"User ID: {id}", message.chat.id, message.message_id, reply_markup=markup)
+
+    def callback_query(self, call: types.CallbackQuery):
+        if call.data == "null":
+            logger.error(_("Invalid callback data received"))
+            return
+        if call.message.chat.id != self.group_id or call.message.message_thread_id is not None:
+            return
+        try:
+            data = json.loads(call.data)
+            action = data["action"]
+        except json.JSONDecodeError:
+            logger.error(_("Invalid JSON data received"))
+            return
+        markup = types.InlineKeyboardMarkup()
+        back_button = types.InlineKeyboardButton("⬅️" + _("Back"), callback_data=json.dumps({"action": "menu"}))
+        match action:
+            case "menu":
+                self.menu(call.message, edit=True)
+            case "auto_reply":
+                markup.add(types.InlineKeyboardButton("➕" + _("Add Auto Reply"),
+                                                      callback_data=json.dumps({"action": "start_add_auto_reply"}))
+                           )
+                markup.add(types.InlineKeyboardButton("⚙️" + _("Manage Existing Auto Reply"),
+                                                      callback_data=json.dumps({"action": "manage_auto_reply"}))
+                           )
+                markup.add(back_button)
+                self.bot.edit_message_text(_("Auto Reply"), call.message.chat.id, call.message.message_id,
+                                           reply_markup=markup)
+            case "set_auto_reply_type":
+                if "regex" not in data:
+                    self.bot.delete_message(self.group_id, call.message.message_id)
+                    self.bot.send_message(self.group_id, _("Invalid action"), reply_markup=markup)
+                    return
+                self.cache.set("auto_response_regex", data["regex"], 300)
+                self.add_auto_response_value(call.message)
+            case "start_add_auto_reply":
+                self.add_auto_response(call.message)
+            case "add_auto_reply":
+                self.process_add_auto_reply(call.message, data)
+            case "manage_auto_reply":
+                self.manage_auto_reply(call.message)
+            case "select_auto_reply":
+                if "id" not in data:
+                    self.bot.delete_message(self.group_id, call.message.message_id)
+                    self.bot.send_message(self.group_id, _("Invalid action"), reply_markup=markup)
+                    return
+                self.select_auto_reply(call.message, data["id"])
+            case "delete_auto_reply":
+                if "id" not in data:
+                    self.bot.delete_message(self.group_id, call.message.message_id)
+                    self.bot.send_message(self.group_id, _("Invalid action"), reply_markup=markup)
+                    return
+                self.delete_auto_reply(call.message, data["id"])
+            case "ban_user":
+                self.manage_ban_user(call.message)
+            case "unban_user":
+                if "id" not in data:
+                    self.bot.delete_message(self.group_id, call.message.message_id)
+                    self.bot.send_message(self.group_id, _("Invalid action"), reply_markup=markup)
+                    return
+                self.unban_user(call.message, user_id=data["id"])
+            case "select_ban_user":
+                if "id" not in data:
+                    self.bot.delete_message(self.group_id, call.message.message_id)
+                    self.bot.send_message(self.group_id, _("Invalid action"), reply_markup=markup)
+                    return
+                self.select_ban_user(call.message, data["id"])
+            case _:
+                logger.error(_("Invalid action received"))
+        return
 
 
 if __name__ == "__main__":
@@ -268,6 +634,5 @@ if __name__ == "__main__":
     try:
         bot = TGBot(args.token, args.group_id)
     except KeyboardInterrupt:
-        bot.bot.stop_polling()
         logger.info(_("Exiting..."))
         exit(0)
