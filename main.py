@@ -56,10 +56,7 @@ class TGBot:
         logger.info(_("Starting BetterForward..."))
         self.group_id = int(group_id)
         self.bot = telebot.TeleBot(bot_token)
-
         self.bot.message_handler(commands=["start"])(self.start_message)
-
-        self.bot.message_handler(commands=["auto_response"])(self.manage_auto_response)
         self.bot.message_handler(commands=["help"])(self.help)
         self.bot.message_handler(commands=["ban"])(self.ban_user)
         self.bot.message_handler(commands=["unban"])(self.unban_user)
@@ -82,11 +79,11 @@ class TGBot:
         self.message_processor.start()
         self.bot.infinity_polling(skip_pending=True, timeout=30)
 
+    def start_message(self, message: Message):
+        self.bot.send_message(message.chat.id, _("欢迎使用 [𝐉.P ❀ - 私聊助手], 消息直接发送即可。"))
+
     def check_valid_chat(self, message: Message):
         return message.chat.id == self.group_id and message.message_thread_id is None
-
-    def start_message(self, message: Message):
-        self.bot.send_message(message.chat.id, _("欢迎使用 pm_jp_bot, 消息直接发送即可。"))
 
     def upgrade_db(self):
         try:
@@ -208,7 +205,7 @@ class TGBot:
                         auto_response = auto_response_result["response"]
                 # Forward message to group
                 userid = message.from_user.id
-                result = curser.execute("SELECT thread_id FROM topics WHERE user_id = ?", (userid,))
+                result = curser.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1", (userid,))
                 thread_id = result.fetchone()
                 if thread_id is None:
                     # Create a new thread
@@ -409,7 +406,7 @@ class TGBot:
             self.menu(message)
         else:
             self.bot.send_message(message.chat.id, _("This command is only available to admin users.") + "\n" +
-                                  "Powered by [BetterForward](https://github.com/SideCloudGroup/BetterForward).",
+                                  "Powered by [BetterForward](https://github.com/Jv0id/BetterForward).",
                                   parse_mode="Markdown",
                                   disable_web_page_preview=True)
 
