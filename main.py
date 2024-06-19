@@ -52,7 +52,7 @@ signal.signal(signal.SIGTERM, handle_sigterm)
 
 class TGBot:
     def __init__(self, bot_token: str, group_id: str, db_path: str = "./data/storage.db"):
-        logger.info(_("Starting BetterForward..."))
+        logger.info(_("BetterForward has started..."))
         self.group_id = int(group_id)
         self.bot = TeleBot(bot_token)
         self.bot.message_handler(commands=["start"])(self.start_message)
@@ -80,7 +80,7 @@ class TGBot:
         self.bot.infinity_polling(skip_pending=True, timeout=30)
 
     def start_message(self, message: Message):
-        self.bot.send_message(message.chat.id, _("欢迎使用 [𝐉.P ❀ - 私聊助手], 消息直接发送即可。"))
+        self.bot.send_message(message.chat.id, _("欢迎使用 [𝐉.P ❀ - 私聊助手], 消息直接发送即可。\n\nWelcome to use [𝐉.P ❀ - Private Chat Assistant], send the message directly."))
 
     def check_valid_chat(self, message: Message):
         return message.chat.id == self.group_id and message.message_thread_id is None
